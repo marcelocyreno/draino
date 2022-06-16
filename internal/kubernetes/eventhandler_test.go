@@ -76,6 +76,14 @@ func (d *mockCordonDrainer) HasSchedule(name string) (has, failed bool) {
 	return false, false
 }
 
+func (d *mockCordonDrainer) IsScheduledByOldEvent(name string, transitionTime time.Time) bool {
+	d.calls = append(d.calls, mockCall{
+		name: "IsScheduledByOldEvent",
+		node: name,
+	})
+	return true
+}
+
 func (d *mockCordonDrainer) Schedule(node *core.Node) (time.Time, error) {
 	d.calls = append(d.calls, mockCall{
 		name: "Schedule",

@@ -172,6 +172,20 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 	if !hasSChedule {
 		h.scheduleDrain(n)
 		return
+	} else {
+		var isScheduledByOldEvent bool = false
+		for _, c := range badConditions {
+			transitionTime, exist := getTransitionTime(n, c.Type)
+			if exist {
+				isScheduledByOldEvent = h.drainScheduler.IsScheduledByOldEvent(n.GetName(), transitionTime)
+			}
+		}
+		if isScheduledByOldEvent {
+			h.logger.Info("Already scheduled by an old event, scheduling new drain.", zap.Bool("isValid", isScheduledByOldEvent))
+			h.drainScheduler.DeleteSchedule(n.GetName())
+			h.scheduleDrain(n)
+			return
+		}
 	}
 
 	// Is there a request to retry a failed drain activity. If yes reschedule drain
@@ -180,6 +194,15 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 		h.scheduleDrain(n)
 		return
 	}
+}
+
+func getTransitionTime(n *core.Node, conditionType core.NodeConditionType) (time.Time, bool) {
+	for _, nodeCondition := range n.Status.Conditions {
+		if nodeCondition.Type == conditionType {
+			return nodeCondition.LastTransitionTime.Time, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (h *DrainingResourceEventHandler) offendingConditions(n *core.Node) []SuppliedCondition {

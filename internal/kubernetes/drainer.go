@@ -186,21 +186,32 @@ func (d *APICordonDrainer) deleteTimeout() time.Duration {
 
 // Cordon the supplied node. Marks it unschedulable for new pods.
 func (d *APICordonDrainer) Cordon(n *core.Node, mutators ...nodeMutatorFn) error {
-	fresh, err := d.c.CoreV1().Nodes().Get(n.GetName(), meta.GetOptions{})
-	if err != nil {
-		return errors.Wrapf(err, "cannot get node %s", n.GetName())
+	for {
+		fresh, err := d.c.CoreV1().Nodes().Get(n.GetName(), meta.GetOptions{})
+		if err != nil {
+			return errors.Wrapf(err, "cannot get node %s", n.GetName())
+		}
+
+		if fresh.Spec.Unschedulable {
+			return nil
+		}
+
+		fresh.Spec.Unschedulable = true
+		for _, m := range mutators {
+			m(fresh)
+		}
+
+		if _, err := d.c.CoreV1().Nodes().Update(fresh); err != nil {
+			if apierrors.IsConflict(err) {
+				d.l.Info("Sleep to retry for conflict error")
+				time.Sleep(5)
+			} else {
+				return errors.Wrapf(err, "cannot cordon node %s", fresh.GetName())
+			}
+		} else {
+			return nil
+		}
 	}
-	if fresh.Spec.Unschedulable {
-		return nil
-	}
-	fresh.Spec.Unschedulable = true
-	for _, m := range mutators {
-		m(fresh)
-	}
-	if _, err := d.c.CoreV1().Nodes().Update(fresh); err != nil {
-		return errors.Wrapf(err, "cannot cordon node %s", fresh.GetName())
-	}
-	return nil
 }
 
 // Uncordon the supplied node. Marks it schedulable for new pods.
@@ -286,7 +297,6 @@ func IsMarkedForDrain(n *core.Node) bool {
 
 // Drain the supplied node. Evicts the node of all but mirror and DaemonSet pods.
 func (d *APICordonDrainer) Drain(n *core.Node) error {
-
 	// Do nothing if draining is not enabled.
 	if d.skipDrain {
 		d.l.Debug("Skipping drain because draining is disabled")
@@ -303,12 +313,14 @@ func (d *APICordonDrainer) Drain(n *core.Node) error {
 	for _, pod := range pods {
 		go d.evict(pod, abort, errs)
 	}
+
 	// This will _eventually_ abort evictions. Evictions may spend up to
 	// d.deleteTimeout() in d.awaitDeletion(), or 5 seconds in backoff before
 	// noticing they've been aborted.
 	defer close(abort)
 
 	deadline := time.After(d.deleteTimeout())
+
 	for range pods {
 		select {
 		case err := <-errs:
@@ -337,7 +349,10 @@ func (d *APICordonDrainer) getPods(node string) ([]core.Pod, error) {
 			return nil, errors.Wrap(err, "cannot filter pods")
 		}
 		if passes {
+			d.l.Info("Pod added to list", zap.String("PodName", p.Name))
 			include = append(include, p)
+		} else {
+			d.l.Info("Pod ignored list", zap.String("PodName", p.Name))
 		}
 	}
 	return include, nil
@@ -348,6 +363,7 @@ func (d *APICordonDrainer) evict(p core.Pod, abort <-chan struct{}, e chan<- err
 	if p.Spec.TerminationGracePeriodSeconds != nil && *p.Spec.TerminationGracePeriodSeconds < gracePeriod {
 		gracePeriod = *p.Spec.TerminationGracePeriodSeconds
 	}
+
 	for {
 		select {
 		case <-abort:
@@ -358,6 +374,7 @@ func (d *APICordonDrainer) evict(p core.Pod, abort <-chan struct{}, e chan<- err
 				ObjectMeta:    meta.ObjectMeta{Namespace: p.GetNamespace(), Name: p.GetName()},
 				DeleteOptions: &meta.DeleteOptions{GracePeriodSeconds: &gracePeriod},
 			})
+
 			switch {
 			// The eviction API returns 429 Too Many Requests if a pod
 			// cannot currently be evicted, for example due to a pod

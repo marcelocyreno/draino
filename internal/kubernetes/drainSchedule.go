@@ -25,6 +25,7 @@ type DrainScheduler interface {
 	HasSchedule(name string) (has, failed bool)
 	Schedule(node *v1.Node) (time.Time, error)
 	DeleteSchedule(name string)
+	IsScheduledByOldEvent(name string, transitionTime time.Time) bool
 }
 
 type DrainSchedules struct {
@@ -49,6 +50,16 @@ func NewDrainSchedules(drainer Drainer, eventRecorder record.EventRecorder, peri
 	}
 }
 
+func (d *DrainSchedules) IsScheduledByOldEvent(name string, transitionTime time.Time) bool {
+	d.Lock()
+	defer d.Unlock()
+	sched, ok := d.schedules[name]
+	if !ok {
+		return true
+	}
+	return sched.when.Before(transitionTime) && !sched.isFailed() && !sched.finish.IsZero()
+}
+
 func (d *DrainSchedules) HasSchedule(name string) (has, failed bool) {
 	d.Lock()
 	defer d.Unlock()
@@ -56,6 +67,7 @@ func (d *DrainSchedules) HasSchedule(name string) (has, failed bool) {
 	if !ok {
 		return false, false
 	}
+	d.logger.Info("HasSchedule", zap.Time("when", sched.when), zap.Time("finish", sched.finish), zap.Bool("isFailed", sched.isFailed()))
 	return true, sched.isFailed()
 }
 
@@ -102,6 +114,7 @@ func (d *DrainSchedules) Schedule(node *v1.Node) (time.Time, error) {
 		SetConditionTimeout,
 	); err != nil {
 		// if we cannot mark the node, let's remove the schedule
+		d.logger.Info("Delete Schedule")
 		d.DeleteSchedule(node.GetName())
 		return time.Time{}, err
 	}
@@ -133,9 +146,10 @@ func (d *DrainSchedules) newSchedule(node *v1.Node, when time.Time) *schedule {
 		tags, _ := tag.New(context.Background(), tag.Upsert(TagNodeName, node.GetName())) // nolint:gosec
 		d.eventRecorder.Event(nr, core.EventTypeWarning, eventReasonDrainStarting, "Draining node")
 		if err := d.drainer.Drain(node); err != nil {
+			log.Info("Failed to drain", zap.Error(err))
+
 			sched.finish = time.Now()
 			sched.setFailed()
-			log.Info("Failed to drain", zap.Error(err))
 			tags, _ = tag.New(tags, tag.Upsert(TagResult, tagResultFailed)) // nolint:gosec
 			stats.Record(tags, MeasureNodesDrained.M(1))
 			d.eventRecorder.Eventf(nr, core.EventTypeWarning, eventReasonDrainFailed, "Draining failed: %v", err)
@@ -150,8 +164,9 @@ func (d *DrainSchedules) newSchedule(node *v1.Node, when time.Time) *schedule {
 			}
 			return
 		}
-		sched.finish = time.Now()
+
 		log.Info("Drained")
+		sched.finish = time.Now()
 		tags, _ = tag.New(tags, tag.Upsert(TagResult, tagResultSucceeded)) // nolint:gosec
 		stats.Record(tags, MeasureNodesDrained.M(1))
 		d.eventRecorder.Event(nr, core.EventTypeWarning, eventReasonDrainSucceeded, "Drained node")

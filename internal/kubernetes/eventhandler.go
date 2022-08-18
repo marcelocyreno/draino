@@ -55,7 +55,9 @@ const (
 	drainRetryAnnotationKey   = "draino/drain-retry"
 	drainRetryAnnotationValue = "true"
 
-	drainoConditionsAnnotationKey = "draino.planet.com/conditions"
+	drainoConditionsAnnotationKey = "draino.kubernetes.io/node-conditions"
+
+	AutoscalerTaint = "ToBeDeletedByClusterAutoscaler"
 )
 
 // Opencensus measurements.
@@ -140,19 +142,31 @@ func (h *DrainingResourceEventHandler) OnUpdate(_, newObj interface{}) {
 // OnDelete does nothing. There's no point cordoning or draining deleted nodes.
 
 func (h *DrainingResourceEventHandler) OnDelete(obj interface{}) {
-	n, ok := obj.(*core.Node)
-	if !ok {
+	if n, ok := obj.(*core.Node); !ok {
 		d, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			return
 		}
 		h.drainScheduler.DeleteSchedule(d.Key)
+	} else {
+		h.drainScheduler.DeleteSchedule(n.GetName())
 	}
-
-	h.drainScheduler.DeleteSchedule(n.GetName())
 }
 
 func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
+	// Skip handling the node if the Cluster Autoscaler has set
+	// its deletion taint
+	autoscalerTaint := core.Taint{
+		Key:    AutoscalerTaint,
+		Effect: "NoSchedule",
+	}
+
+	nodeTaints := n.Spec.Taints
+	if len(nodeTaints) > 0 && taintExists(nodeTaints, &autoscalerTaint) {
+		h.logger.Info("Node is being scaled down by cluster-autoscaler, skipping.", zap.String("node", n.GetName()))
+		return
+	}
+
 	badConditions := h.offendingConditions(n)
 	if len(badConditions) == 0 {
 		if shouldUncordon(n) {
@@ -181,7 +195,7 @@ func (h *DrainingResourceEventHandler) HandleNode(n *core.Node) {
 			}
 		}
 		if isScheduledByOldEvent {
-			h.logger.Info("Already scheduled by an old event, scheduling new drain.", zap.Bool("isValid", isScheduledByOldEvent))
+			h.logger.Info("Already scheduled by an old event, scheduling new drain.", zap.String("node", n.GetName()), zap.Bool("isValid", isScheduledByOldEvent))
 			h.drainScheduler.DeleteSchedule(n.GetName())
 			h.scheduleDrain(n)
 			return
@@ -336,4 +350,13 @@ func (h *DrainingResourceEventHandler) scheduleDrain(n *core.Node) {
 
 func HasDrainRetryAnnotation(n *core.Node) bool {
 	return n.GetAnnotations()[drainRetryAnnotationKey] == drainRetryAnnotationValue
+}
+
+func taintExists(taints []core.Taint, taintToFind *core.Taint) bool {
+	for _, taint := range taints {
+		if taint.MatchTaint(taintToFind) {
+			return true
+		}
+	}
+	return false
 }
